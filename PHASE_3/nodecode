@@ -5,8 +5,8 @@
 #include "addons/RTDBHelper.h"
 
 // Firebase config
-#define WIFI_SSID "act"
-#define WIFI_PASSWORD "dcpne@123"
+#define WIFI_SSID "test"
+#define WIFI_PASSWORD "test1234"
 #define API_KEY "AIzaSyDKu_cmH5F23MzWyeTgLp8iPx2WhSpJljI"
 #define DATABASE_URL "https://stsemel-default-rtdb.asia-southeast1.firebasedatabase.app"
 
