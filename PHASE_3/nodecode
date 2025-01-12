@@ -1,0 +1,210 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// Firebase config
+#define WIFI_SSID "act"
+#define WIFI_PASSWORD "dcpne@123"
+#define API_KEY "AIzaSyDKu_cmH5F23MzWyeTgLp8iPx2WhSpJljI"
+#define DATABASE_URL "https://stsemel-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+// Define Firebase Data objects - one for each stream
+FirebaseData fbdo;
+FirebaseData fbdoManual;  // Added second FirebaseData object for manual control
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Motor control pins
+const int EN_PIN = 13;
+const int IN1_PIN = 12;
+const int IN2_PIN = 14;
+
+uint8_t nodeMacAddress[] = {0xD0, 0xEF, 0x76, 0x57, 0xF4, 0x3C};
+
+typedef struct struct_message {
+  bool motorRunning;
+  int moistureLevel;
+} struct_message;
+
+struct_message incomingData;
+struct_message outgoingData;
+
+volatile bool motorRunning = false;
+volatile bool systemActive = false;
+volatile bool manualMotor = false;
+
+unsigned long lastMoistureUpdate = 0;
+const unsigned long MOISTURE_UPDATE_INTERVAL = 5000; // Update every 5 seconds
+
+void sendData(const bool motorState, int moistureLevel) {
+  outgoingData.motorRunning = motorState;
+  outgoingData.moistureLevel = moistureLevel;
+  esp_err_t result = esp_now_send(nodeMacAddress, (uint8_t *)&outgoingData, sizeof(outgoingData));
+  if (result != ESP_OK) {
+    Serial.println("Error sending data");
+  }
+}
+
+void startMotor() {
+  if (systemActive) {  // Only start if system is active
+    motorRunning = true;
+    digitalWrite(EN_PIN, HIGH);
+    digitalWrite(IN1_PIN, HIGH);
+    digitalWrite(IN2_PIN, LOW);
+    Serial.println("Motor started");
+  }
+}
+
+void stopMotor() {
+  motorRunning = false;
+  digitalWrite(EN_PIN, LOW);
+  Serial.println("Motor stopped");
+}
+
+void updateMoistureToFirebase(int moisture) {
+  if (Firebase.ready()) {
+    if (Firebase.RTDB.setInt(&fbdo, "systemData/systemDoc/moistureLevel", moisture)) {
+      Serial.println("Moisture updated: " + String(moisture));
+    } else {
+      Serial.println("Firebase update failed: " + fbdo.errorReason());
+    }
+  }
+}
+
+void systemActiveCallback(FirebaseStream data) {
+  Serial.println("SystemActiveCallback triggered");  // Debug
+  if (data.dataTypeEnum() == fb_esp_rtdb_data_type_boolean) {
+    systemActive = data.boolData();
+    Serial.println("System Active: " + String(systemActive));
+    if (!systemActive) {
+      stopMotor();  // Stop motor if system becomes inactive
+    }
+  } else {
+    Serial.println("Unexpected data type in systemActiveCallback");
+  }
+}
+
+void manualMotorCallback(FirebaseStream data) {
+  Serial.println("ManualMotorCallback triggered");  // Debug
+  if (data.dataTypeEnum() == fb_esp_rtdb_data_type_boolean) {
+    manualMotor = data.boolData();
+    Serial.println("Manual Motor: " + String(manualMotor));
+    if (!systemActive) {
+      if (manualMotor) {
+        startMotor();
+      } else {
+        stopMotor();
+      }
+    }
+  } else {
+    Serial.println("Unexpected data type in manualMotorCallback");
+  }
+}
+
+void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+  if (len == sizeof(struct_message)) {
+    memcpy(&incomingData, data, sizeof(incomingData));
+    // Only update moisture to Firebase every 5 seconds
+    if (millis() - lastMoistureUpdate >= MOISTURE_UPDATE_INTERVAL) {
+      updateMoistureToFirebase(incomingData.moistureLevel);
+      lastMoistureUpdate = millis();
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(EN_PIN, OUTPUT);
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+  stopMotor();  // Ensure motor starts in OFF state
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // Enable Anonymous Sign-In
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Signing in anonymously...");
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Signed in anonymously, UID: " + String(auth.token.uid.c_str()));
+  } else {
+    Serial.println("Anonymous sign-in failed: " + String(config.signer.signupError.message.c_str()));
+    return;  // Halt if authentication fails
+  }
+
+  // ESP-NOW Setup
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW initialization failed");
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, nodeMacAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  if (!Firebase.RTDB.beginStream(&fbdo, "systemData/systemDoc/systemActive")) {
+    Serial.println("Could not begin stream 1: " + fbdo.errorReason());
+  } else {
+    Serial.println("Stream 1 started successfully.");
+    Firebase.RTDB.setStreamCallback(&fbdo, systemActiveCallback, NULL);
+  }
+
+  if (!Firebase.RTDB.beginStream(&fbdoManual, "systemData/systemDoc/manualMotor")) {
+    Serial.println("Could not begin stream 2: " + fbdoManual.errorReason());
+  } else {
+    Serial.println("Stream 2 started successfully.");
+    Firebase.RTDB.setStreamCallback(&fbdoManual, manualMotorCallback, NULL);
+  }
+
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  // Reconnect to WiFi if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected. Reconnecting...");
+    WiFi.reconnect();
+  }
+
+  // Check if Firebase is ready
+  if (!Firebase.ready()) {
+    Serial.println("Firebase not ready: " + String(fbdo.errorReason()));
+  }
+
+  // Check if it's time to update the moisture level in Firebase
+  if (millis() - lastMoistureUpdate >= MOISTURE_UPDATE_INTERVAL) {
+    updateMoistureToFirebase(incomingData.moistureLevel);
+    lastMoistureUpdate = millis();  // Update the last update time
+  }
+
+  // Check if stream data is available
+  if (fbdo.streamAvailable()) {
+    Serial.println("Stream 1 data available");
+  }
+
+  if (fbdoManual.streamAvailable()) {
+    Serial.println("Stream 2 data available");
+  }
+
+  delay(1000);  // Periodic debug interval
+}
